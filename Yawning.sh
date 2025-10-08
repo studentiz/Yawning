@@ -1,22 +1,22 @@
 #!/bin/bash
-# Yawning.sh – A simple, friendly power‑saving helper 💤
+# Yawning.sh – A simple, friendly power-saving helper 💤
 #
 # Overview:
-#   It uses macOS's built‑in `taskpolicy` to assign matching processes to Apple Silicon efficiency cores,
+#   It uses macOS's built-in `taskpolicy` to assign matching processes to Apple Silicon efficiency cores,
 #   reducing power draw and heat so your Mac can relax 😴.
 #
 # Highlights:
 #   • Support matching process names or operating on all user processes.
 #   • Optional foreground detection: also assign the current frontmost app to efficiency cores.
 #   • Optional balance mode: intelligently switch between efficiency/performance cores based on CPU usage.
-#   • Provide start/stop commands for one‑shot start and graceful stop; safe defaults for beginners.
+#   • Provide start/stop commands for one-shot start and graceful stop; safe defaults for beginners.
 
 set -e
 
 # PID file for the background loop so the stop command can terminate it
 PIDFILE="/tmp/yawning.pid"
 
-# Default options (beginner‑friendly): equivalent to -g -f -B -b 80 -c 150
+# Default options (beginner-friendly): equivalent to -g -f -B -b 80 -c 150
 DEFAULT_GLOBAL=true
 DEFAULT_FRONT=true
 DEFAULT_BALANCE=true
@@ -28,7 +28,7 @@ usage() {
 Yawning – let your Mac take a nap 💤
 
 Usage:
-  ./Yawning.sh start [options]   Start the background power‑saving loop
+  ./Yawning.sh start [options]   Start the background power-saving loop
   ./Yawning.sh stop              Stop the running Yawning instance and clean the PID file
   ./Yawning.sh help              Show this help message
 
@@ -38,10 +38,10 @@ If no arguments are provided, running "./Yawning.sh" is equivalent to:
 Options (for the 'start' subcommand):
   -p PATTERN     Add a process name pattern to match (repeatable). Examples:
                  -p "Google Chrome" -p "Electron"
-  -g             Global scan: operate on all non‑root user processes (not only by name)
+  -g             Global scan: operate on all non-root user processes (not only by name)
   -f             Foreground detection: also assign the current frontmost app to efficiency cores
   -B             Balance mode: under heavy load, temporarily move hot processes to performance cores
-  -b THRESHOLD   Per‑process CPU threshold for balance mode (default 80)
+  -b THRESHOLD   Per-process CPU threshold for balance mode (default 80)
   -c THRESHOLD   Total system CPU threshold for balance mode (default 150)
 
 Examples:
@@ -68,41 +68,52 @@ run_loop() {
     local balance_threshold="$RUN_BAL_THRESHOLD"
     local cpu_threshold="$RUN_CPU_THRESHOLD"
 
-    # Pin this shell process to efficiency cores
-    taskpolicy -b -p $$
+    # Pin THIS background shell process to efficiency cores
+    local self_pid="${BASHPID:-$$}"
+    taskpolicy -b -p "$self_pid" 2>/dev/null || true
 
     local assigned_eff=()
     local assigned_perf=()
     local sleep_time=50
 
     while true; do
-        local timestamp=$(date "+%H:%M:%S")
+        local timestamp
+        timestamp=$(date "+%H:%M:%S")
         echo "[$timestamp] Scanning processes..."
 
-        # 获取待处理 PID 列表
+        # Build candidate PID list
         local pid_list
         if [[ "$global_search" == true ]]; then
+            # Avoid root/Apple/_ users (typical system accounts)
             pid_list=$(ps aux | awk '$1!="root" && $1!="Apple" && $1!~ /^_/ { print $2 }')
         else
-            local regex
-            regex=$(printf "|%s" "${patterns[@]}")
-            regex=${regex:1}
-            pid_list=$(ps aux | grep -E "$regex" | grep -v grep | awk '{print $2}')
+            if [[ ${#patterns[@]} -eq 0 ]]; then
+                # no patterns and not global -> nothing to do
+                pid_list=""
+            else
+                local regex
+                regex=$(printf "|%s" "${patterns[@]}")
+                regex=${regex:1}
+                pid_list=$(ps aux | grep -E "$regex" | grep -v grep | awk '{print $2}')
+            fi
         fi
 
         # Foreground app detection
         if [[ "$enable_front" == true ]]; then
             local front_pid
             front_pid=$(osascript -e 'tell application "System Events" to get unix id of first process whose frontmost is true' 2>/dev/null || true)
-            if [[ -n "$front_pid" ]]; then
-                taskpolicy -b -p "$front_pid" && echo "Frontmost app PID $front_pid assigned to efficiency cores"
+            if [[ -n "$front_pid" && "$front_pid" =~ ^[0-9]+$ ]]; then
+                taskpolicy -b -p "$front_pid" 2>/dev/null && echo "Frontmost app PID $front_pid assigned to efficiency cores"
             fi
         fi
 
         for pid in $pid_list; do
             [[ "$pid" =~ ^[0-9]+$ ]] || continue
+            # Skip self/background manager PIDs
+            [[ "$pid" -eq "$self_pid" ]] && continue
 
             if [[ "$enable_balance" == true ]]; then
+                # System total CPU (mean across processes) and per-process CPU
                 local total_cpu
                 total_cpu=$(ps -A -o %cpu | awk 'NR>1 {s+=$1} END {printf "%.0f", s/NR*100}')
                 local cpu_usage
@@ -110,8 +121,9 @@ run_loop() {
                 local cpu_int=${cpu_usage%.*}
                 if [[ "$total_cpu" -gt "$cpu_threshold" && "$cpu_int" -gt "$balance_threshold" ]]; then
                     if [[ ! " ${assigned_perf[*]} " =~ " ${pid} " ]]; then
-                        taskpolicy -B -p "$pid" && echo "[BALANCE] PID $pid using CPU ${cpu_usage}% ，assigned to performance cores"
+                        taskpolicy -B -p "$pid" 2>/dev/null && echo "[BALANCE] PID $pid using CPU ${cpu_usage}% — assigned to performance cores"
                         assigned_perf+=("$pid")
+                        # remove from efficiency list if present
                         assigned_eff=("${assigned_eff[@]/$pid}")
                     fi
                     continue
@@ -120,20 +132,22 @@ run_loop() {
 
             # Default case: assign to efficiency cores
             if [[ ! " ${assigned_eff[*]} " =~ " ${pid} " ]]; then
-                if taskpolicy -b -p "$pid"; then
+                if taskpolicy -b -p "$pid" 2>/dev/null; then
                     local cmd
                     cmd=$(ps -p "$pid" -o comm= | sed -E 's#.*/([^/]*\.app)/.*MacOS/##')
-                    echo "已将 \"${cmd:-PID}\" (PID $pid) 分配到效率核心"
+                    echo "Assigned \"${cmd:-PID}\" (PID $pid) to efficiency cores"
                     assigned_eff+=("$pid")
+                    # remove from performance list if present
                     assigned_perf=("${assigned_perf[@]/$pid}")
                 fi
+                # tighten the loop slightly after new assignments
                 if [[ $sleep_time -gt 15 ]]; then
                     ((sleep_time-=3))
                 fi
             fi
         done
 
-        # Dynamically adjust the sleep interval to avoid high system load【242746668458481†L125-L144】
+        # Dynamically adjust the sleep interval to avoid high system load
         if [[ $sleep_time -lt 1 ]]; then
             sleep_time=10
         elif [[ $sleep_time -lt 15 ]]; then
@@ -205,7 +219,6 @@ case "$cmd" in
 
         # If explicit options are provided after 'start', override defaults
         if [[ "$cmd" == "start" ]]; then
-            # 如果用户在 start 后提供参数，则覆盖默认
             while [[ $# -gt 0 ]]; do
                 case "$1" in
                     -p)
